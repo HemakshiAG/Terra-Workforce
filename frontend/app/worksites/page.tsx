@@ -43,7 +43,7 @@ export default function WorksitesPage() {
   }, []);
 
   async function loadWorksites() {
-    const token = localStorage.getItem('terra-session-token') ?? localStorage.getItem('terra-workforce-token');
+    const token = localStorage.getItem('terra-session-token') ?? localStorage.getItem('terra-workforce-token') ?? '';
     if (!token) return;
 
     try {
@@ -120,7 +120,7 @@ export default function WorksitesPage() {
     setError('');
     setIsSubmitting(true);
 
-    const token = localStorage.getItem('terra-session-token') ?? localStorage.getItem('terra-workforce-token');
+    const token = localStorage.getItem('terra-session-token') ?? localStorage.getItem('terra-workforce-token') ?? '';
     if (!token) {
       setError('Authentication token missing.');
       setIsSubmitting(false);

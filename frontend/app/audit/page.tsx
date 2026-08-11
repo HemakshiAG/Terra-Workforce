@@ -18,7 +18,7 @@ export default function AuditPage() {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    const token = localStorage.getItem('terra-session-token') ?? localStorage.getItem('terra-workforce-token');
+    const token = localStorage.getItem('terra-session-token') ?? localStorage.getItem('terra-workforce-token') ?? '';
     if (!token) {
       setIsLoading(false);
       return;

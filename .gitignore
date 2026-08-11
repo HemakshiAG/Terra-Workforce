@@ -75,3 +75,9 @@ htmlcov/
 *.tmp
 *.temp
 *.swp
+
+# =========================
+# Local biometric storage
+# =========================
+
+backend/data/private/

@@ -1,7 +1,12 @@
 import hashlib
 import json
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+if __package__ in {None, ''}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -23,7 +28,6 @@ from backend.app.auth import (
 )
 from backend.app.database import SessionLocal, init_db
 from backend.app.models import (
-    AttendanceModel,
     AuthSession,
     IntegrityAlertModel,
     Organization,
@@ -41,6 +45,30 @@ from backend.app.schemas import (
     RegisterOrganizationRequest,
     WorksiteCreate,
     WorksiteUpdate,
+)
+from backend.app.worker_phase2 import (
+    enrollment_complete_endpoint,
+    enrollment_get_endpoint,
+    enrollment_samples_endpoint,
+    enrollment_start_endpoint,
+    worker_consent_endpoint,
+    worker_delete_endpoint,
+    worker_detail_endpoint,
+    worker_identity_endpoint,
+    worker_update_endpoint,
+    workers_create_endpoint,
+    workers_list_endpoint,
+)
+from backend.app.routers.attendance import (
+    create_session_endpoint,
+    get_sessions_endpoint,
+    open_session_endpoint,
+    close_session_endpoint,
+    verify_attendance_endpoint,
+    check_in_endpoint,
+    check_out_endpoint,
+    generate_qr_endpoint,
+    verify_qr_endpoint,
 )
 
 
@@ -403,12 +431,32 @@ app = Starlette(
         Route('/api/admin/worksites', admin_worksites_endpoint, methods=['GET', 'POST']),
         Route('/api/admin/worksites/{worksite_id:int}', admin_worksite_detail_endpoint, methods=['PUT']),
         Route('/api/worksites', admin_worksites_endpoint, methods=['GET', 'POST']),
+        Route('/api/workers', workers_list_endpoint, methods=['GET']),
+        Route('/api/workers', workers_create_endpoint, methods=['POST']),
+        Route('/api/workers/{worker_id:int}', worker_detail_endpoint, methods=['GET']),
+        Route('/api/workers/{worker_id:int}', worker_update_endpoint, methods=['PATCH']),
+        Route('/api/workers/{worker_id:int}', worker_delete_endpoint, methods=['DELETE']),
+        Route('/api/workers/{worker_id:int}/identity', worker_identity_endpoint, methods=['POST']),
+        Route('/api/workers/{worker_id:int}/consent', worker_consent_endpoint, methods=['POST']),
+        Route('/api/workers/{worker_id:int}/enrollment', enrollment_get_endpoint, methods=['GET']),
+        Route('/api/workers/{worker_id:int}/enrollment/start', enrollment_start_endpoint, methods=['POST']),
+        Route('/api/workers/{worker_id:int}/enrollment/samples', enrollment_samples_endpoint, methods=['POST']),
+        Route('/api/workers/{worker_id:int}/enrollment/complete', enrollment_complete_endpoint, methods=['POST']),
+        Route('/api/attendance/sessions', create_session_endpoint, methods=['POST']),
+        Route('/api/attendance/sessions', get_sessions_endpoint, methods=['GET']),
+        Route('/api/attendance/sessions/{session_id:int}/open', open_session_endpoint, methods=['POST']),
+        Route('/api/attendance/sessions/{session_id:int}/close', close_session_endpoint, methods=['POST']),
+        Route('/api/attendance/verify', verify_attendance_endpoint, methods=['POST']),
+        Route('/api/attendance/check-in', check_in_endpoint, methods=['POST']),
+        Route('/api/attendance/check-out', check_out_endpoint, methods=['POST']),
+        Route('/api/attendance/qr/generate', generate_qr_endpoint, methods=['POST']),
+        Route('/api/attendance/qr/verify', verify_qr_endpoint, methods=['POST']),
         Route('/403', route_403, methods=['GET']),
     ],
     middleware=[
         Middleware(
             CORSMiddleware,
-            allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:3001'],
+            allow_origin_regex='https?://.*',
             allow_credentials=True,
             allow_methods=['*'],
             allow_headers=['*'],

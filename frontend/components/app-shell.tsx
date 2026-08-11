@@ -11,7 +11,8 @@ const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://127.0.0.1:8
 const navigation = {
   ADMIN: [
     { href: '/dashboard', label: 'Overview', icon: Home },
-    { href: '/workers', label: 'Supervisors', icon: Users },
+    { href: '/workers', label: 'Workers', icon: Users },
+    { href: '/enrollment', label: 'Enrollment', icon: BadgeCheck },
     { href: '/worksites', label: 'Worksites', icon: MapPinned },
     { href: '/integrity', label: 'Integrity', icon: ShieldCheck },
     { href: '/reports', label: 'Reports', icon: FileText },
@@ -20,9 +21,9 @@ const navigation = {
   ],
   SUPERVISOR: [
     { href: '/dashboard', label: 'Overview', icon: Home },
-    { href: '/attendance', label: 'Attendance', icon: Camera },
     { href: '/workers', label: 'Workers', icon: Users },
     { href: '/enrollment', label: 'Enrollment', icon: BadgeCheck },
+    { href: '/attendance', label: 'Attendance', icon: Camera },
     { href: '/worksites', label: 'Worksites', icon: MapPinned },
     { href: '/integrity', label: 'Integrity', icon: ShieldCheck },
     { href: '/wages', label: 'Wages', icon: Wallet },
