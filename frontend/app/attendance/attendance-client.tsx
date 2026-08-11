@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Camera, MapPin, ShieldCheck, TriangleAlert, RotateCcw } from 'lucide-react';
+import { Camera, MapPin, ShieldCheck, TriangleAlert } from 'lucide-react';
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://127.0.0.1:8000';
 
 type Step = 'idle' | 'requesting-camera' | 'camera-active' | 'face-detected' | 'liveness-checking' | 'face-matching' | 'gps-checking' | 'verified' | 'attendance-marked' | 'error';
 
@@ -44,6 +46,13 @@ export function AttendanceClient() {
   const [streamReady, setStreamReady] = useState(false);
 
   const startFlow = async () => {
+    const token = localStorage.getItem('terra-workforce-token');
+    if (!token) {
+      setError('Please sign in to use attendance verification.');
+      setStep('error');
+      return;
+    }
+
     setStep('requesting-camera');
     setError(null);
     setResult(null);
@@ -69,10 +78,13 @@ export function AttendanceClient() {
       await new Promise((resolve) => setTimeout(resolve, 700));
       setStep('face-matching');
 
-      const workerId = 'W-101';
-      const verificationResponse = await fetch('http://127.0.0.1:8000/api/verification', {
+      const workerId = localStorage.getItem('terra-workforce-user') === 'ananya' ? 'W-101' : 'W-101';
+      const verificationResponse = await fetch(`${API_BASE_URL}/api/verification`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({
           worker_id: workerId,
           worksite_id: WORKSITE.id,
@@ -83,7 +95,8 @@ export function AttendanceClient() {
         }),
       });
       if (!verificationResponse.ok) {
-        throw new Error('Verification request failed');
+        const payload = await verificationResponse.json().catch(() => ({}));
+        throw new Error(payload.detail ?? 'Verification request failed');
       }
       const verification = await verificationResponse.json();
 
@@ -103,9 +116,12 @@ export function AttendanceClient() {
         throw new Error('Worker outside configured geofence.');
       }
 
-      const attendanceResponse = await fetch('http://127.0.0.1:8000/api/attendance', {
+      const attendanceResponse = await fetch(`${API_BASE_URL}/api/attendance`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({
           worker_id: workerId,
           worksite_id: WORKSITE.id,
@@ -122,7 +138,8 @@ export function AttendanceClient() {
         }),
       });
       if (!attendanceResponse.ok) {
-        throw new Error('Attendance could not be created.');
+        const payload = await attendanceResponse.json().catch(() => ({}));
+        throw new Error(payload.detail ?? 'Attendance could not be created.');
       }
       const created = await attendanceResponse.json();
       setResult(verification);

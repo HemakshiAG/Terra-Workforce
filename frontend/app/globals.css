@@ -4,6 +4,22 @@
 
 :root {
   color-scheme: dark;
+  --bg: #0b0f0c;
+  --bg-elevated: #101510;
+  --bg-soft: #141a15;
+  --panel: #151b15;
+  --panel-strong: #192019;
+  --line: rgba(183, 196, 170, 0.12);
+  --line-strong: rgba(183, 196, 170, 0.22);
+  --text: #f5f1e8;
+  --text-muted: #b8c0b0;
+  --text-soft: #8d998b;
+  --accent: #b7cc75;
+  --accent-strong: #d7e39b;
+  --warm: #d8c5a4;
+  --danger: #f39d7b;
+  --success: #b7cc75;
+  --shadow: rgba(5, 8, 7, 0.9);
 }
 
 html {
@@ -11,14 +27,49 @@ html {
 }
 
 body {
-  @apply min-h-screen bg-night text-mist antialiased;
-  background-image: radial-gradient(circle at top left, rgba(184, 212, 75, 0.08), transparent 32%);
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, rgba(183, 204, 117, 0.08), transparent 22%),
+    linear-gradient(180deg, #0b0f0c 0%, #0d130f 100%);
+  color: var(--text);
+  font-feature-settings: "ss01" 1, "cv11" 1;
 }
 
 * {
-  @apply border-[#243124];
+  border-color: var(--line);
 }
 
 ::selection {
-  @apply bg-lime/30 text-mist;
+  background: rgba(183, 204, 117, 0.25);
+  color: var(--text);
+}
+
+@layer components {
+  .terra-panel {
+    @apply rounded border border-[rgba(183,196,170,0.12)] bg-[#101510]/90 shadow-[0_18px_45px_rgba(0,0,0,0.18)];
+  }
+
+  .terra-panel-strong {
+    @apply rounded border border-[rgba(183,196,170,0.14)] bg-[#141a15] shadow-[0_18px_45px_rgba(0,0,0,0.22)];
+  }
+
+  .terra-muted {
+    color: var(--text-muted);
+  }
+
+  .terra-kicker {
+    @apply text-[10px] uppercase tracking-[0.38em] text-[#b7cc75];
+  }
+
+  .terra-btn {
+    @apply inline-flex items-center justify-center rounded border border-[#b7cc75]/35 bg-[#b7cc75]/10 px-4 py-2.5 text-sm font-medium text-[#dfeab1] transition hover:border-[#b7cc75]/55 hover:bg-[#b7cc75]/15;
+  }
+
+  .terra-btn-ghost {
+    @apply inline-flex items-center justify-center rounded border border-[rgba(183,196,170,0.15)] bg-transparent px-4 py-2.5 text-sm font-medium text-[var(--text-muted)] transition hover:border-[rgba(183,196,170,0.3)] hover:text-[var(--text)];
+  }
+
+  .terra-grid {
+    @apply grid gap-4 md:gap-5;
+  }
 }

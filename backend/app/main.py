@@ -1,13 +1,47 @@
+import hashlib
+import json
 from datetime import datetime, timezone
-from typing import Any
-from uuid import uuid4
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+from pydantic import ValidationError
+from sqlalchemy import select
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+
+from backend.app.auth import (
+    create_session,
+    get_role_by_name,
+    get_session_token_hash,
+    get_user_by_session,
+    get_user_for_email,
+    hash_password,
+    verify_password,
+)
+from backend.app.database import SessionLocal, init_db
+from backend.app.models import (
+    AttendanceModel,
+    AuthSession,
+    IntegrityAlertModel,
+    Organization,
+    Role,
+    RoleName,
+    SupervisorWorksiteAssignment,
+    SyncQueueModel,
+    User,
+    WorkerModel,
+    Worksite,
+)
+from backend.app.schemas import (
+    CreateSupervisorRequest,
+    LoginRequest,
+    RegisterOrganizationRequest,
+    WorksiteCreate,
+    WorksiteUpdate,
+)
 
 
 class DemoHTTPException(Exception):
@@ -17,241 +51,367 @@ class DemoHTTPException(Exception):
         self.detail = detail
 
 
-# In-memory demo state for hackathon-grade prototype
-workers_store: list[dict[str, Any]] = []
-attendance_store: list[dict[str, Any]] = []
-sync_queue_store: list[dict[str, Any]] = []
+def _parse_payload(schema_cls: Any, payload: Any) -> Any:
+    if hasattr(schema_cls, "model_validate"):
+        return schema_cls.model_validate(payload)
+    return schema_cls.parse_obj(payload)
 
 
-def _make_idempotency_key(payload: dict[str, Any]) -> str:
-    return str(hash(f"{payload.get('worker_id')}-{payload.get('worksite_id')}-{payload.get('event_type')}"))
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def login(payload: dict[str, Any]) -> dict[str, str]:
-    username = payload.get("username")
-    password = payload.get("password")
-    if username == "ananya" and password == "terra-2026":
-        return {
-            "access_token": "demo-token",
-            "token_type": "bearer",
-        }
-    raise DemoHTTPException(status_code=401, detail="Invalid credentials")
+def _read_bearer_token(request: Request) -> Optional[str]:
+    header = request.headers.get('authorization')
+    if isinstance(header, str) and header.lower().startswith('bearer '):
+        return header.split(' ', 1)[1].strip()
+    return None
 
 
-def register_worker(payload: dict[str, Any]) -> dict[str, Any]:
-    worker_id = payload.get("worker_id")
-    if any(worker["worker_id"] == worker_id for worker in workers_store):
-        raise DemoHTTPException(status_code=409, detail="Worker already exists")
-    worker = {
-        "worker_id": worker_id,
-        "name": payload.get("name", "Unknown Worker"),
-        "worksite_id": payload.get("worksite_id"),
-        "latitude": payload.get("latitude", 0.0),
-        "longitude": payload.get("longitude", 0.0),
-        "registered_at": datetime.now(timezone.utc).isoformat(),
-    }
-    workers_store.append(worker)
-    return worker
-
-
-def list_workers() -> list[dict[str, Any]]:
-    return workers_store
-
-
-def verify_attendance(payload: dict[str, Any]) -> dict[str, Any]:
-    worker = next((item for item in workers_store if item["worker_id"] == payload.get("worker_id")), None)
-    if not worker:
-        raise DemoHTTPException(status_code=404, detail="Worker not found")
-
-    geofence_distance = abs(float(payload.get("latitude", 0.0)) - float(worker.get("latitude", 0.0))) + abs(float(payload.get("longitude", 0.0)) - float(worker.get("longitude", 0.0)))
-    geofence_status = "inside" if geofence_distance <= 0.01 else "outside"
-    verification_status = "verified" if payload.get("face_match_confidence", 0.0) >= 0.8 and payload.get("liveness_status") == "passed" and geofence_status == "inside" else "review"
-
+def _serialize_user(user: User, organization: Optional[Organization] = None) -> Dict[str, Any]:
+    role_name = user.role_ref.name if user.role_ref else 'WORKER'
     return {
-        "worker_id": payload.get("worker_id"),
-        "worker_name": worker.get("name"),
-        "verification_status": verification_status,
-        "face_match_confidence": payload.get("face_match_confidence", 0.0),
-        "liveness_status": payload.get("liveness_status", "passed"),
-        "latitude": payload.get("latitude"),
-        "longitude": payload.get("longitude"),
-        "geofence_distance": geofence_distance,
-        "geofence_status": geofence_status,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        'id': user.id,
+        'name': user.name,
+        'email': user.email,
+        'role': role_name,
+        'organization_id': user.organization_id,
+        'organization_name': organization.name if organization else (user.organization.name if user.organization else None),
     }
 
 
-def create_attendance(payload: dict[str, Any]) -> dict[str, Any]:
-    worker_id = payload.get("worker_id")
-    worksite_id = payload.get("worksite_id")
-    confidence = float(payload.get("face_match_confidence", payload.get("confidence", 0)))
-    liveness = payload.get("liveness_status", payload.get("liveness", "passed"))
-    gps_status = payload.get("geofence_status", payload.get("gps_status", "inside"))
-    if gps_status in {"on_site", "inside"}:
-        gps_status = "inside"
-    if gps_status in {"outside_worksite", "outside"}:
-        gps_status = "outside"
-    event_type = payload.get("event_type", "CHECK_IN")
+def _require_auth(request: Request) -> Tuple[User, Any]:
+    token = _read_bearer_token(request)
+    if not token:
+        raise DemoHTTPException(status_code=401, detail='Authentication required.')
 
-    existing = [record for record in attendance_store if record["worker_id"] == worker_id and record["event_type"] == event_type]
-    if existing:
-        raise DemoHTTPException(status_code=409, detail="Already checked in today")
-
-    status_value = "accepted"
-    review_reasons: list[str] = []
-
-    if confidence < 0.8:
-        status_value = "manual_review"
-        review_reasons.append("low_confidence")
-    if liveness == "failed":
-        status_value = "rejected"
-        review_reasons.append("liveness_failed")
-    if gps_status == "outside":
-        status_value = "manual_review"
-        review_reasons.append("geofence_violation")
-
-    record = {
-        "id": str(uuid4()),
-        "worker_id": worker_id,
-        "worksite_id": worksite_id,
-        "timestamp": payload.get("timestamp") or datetime.now(timezone.utc).isoformat(),
-        "verification_status": payload.get("verification_status", "verified"),
-        "face_match_confidence": confidence,
-        "liveness_status": liveness,
-        "latitude": payload.get("latitude"),
-        "longitude": payload.get("longitude"),
-        "geofence_distance": payload.get("geofence_distance", 0.0),
-        "geofence_status": gps_status,
-        "attendance_status": payload.get("attendance_status", "marked"),
-        "event_type": event_type,
-        "status": status_value,
-        "review_reasons": review_reasons,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    attendance_store.append(record)
-    return record
+    db = SessionLocal()
+    user = get_user_by_session(db, token)
+    if not user:
+        db.close()
+        raise DemoHTTPException(status_code=401, detail='Session expired or invalid.')
+    if not user.is_active:
+        db.close()
+        raise DemoHTTPException(status_code=403, detail='Account is disabled.')
+    return user, db
 
 
-def get_today_attendance() -> list[dict[str, Any]]:
-    return attendance_store
+def _require_role(request: Request, allowed_roles: Set[str]) -> Tuple[User, Any]:
+    user, db = _require_auth(request)
+    role_str = user.role_ref.name if user.role_ref else 'WORKER'
+    if allowed_roles and role_str.upper() not in {r.upper() for r in allowed_roles}:
+        db.close()
+        raise DemoHTTPException(status_code=403, detail='You do not have permission to access this workspace.')
+    return user, db
 
 
-def get_dashboard_stats() -> dict[str, Any]:
-    verified = sum(1 for item in attendance_store if item.get("status") == "accepted")
-    review = sum(1 for item in attendance_store if item.get("status") == "manual_review")
-    return {
-        "workers": len(workers_store),
-        "attendance_today": len(attendance_store),
-        "verified": verified,
-        "review": review,
-    }
-
-
-def sync_queue(payload: dict[str, Any]) -> dict[str, Any]:
-    event_type = payload.get("event_type", "attendance")
-    body = payload.get("payload", {})
-    key = _make_idempotency_key(body)
-    existing = next((item for item in sync_queue_store if item["idempotency_key"] == key), None)
-    if existing:
-        return {
-            "id": existing["id"],
-            "idempotency_key": existing["idempotency_key"],
-            "status": "queued",
-        }
-
-    item = {
-        "id": str(uuid4()),
-        "idempotency_key": key,
-        "event_type": event_type,
-        "payload": body,
-        "status": "pending",
-    }
-    sync_queue_store.append(item)
-    return item
-
+# --- Public Auth Endpoints ---
 
 async def health(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({'status': 'ok'})
 
 
-async def login_endpoint(request: Request) -> JSONResponse:
-    payload = await request.json()
+async def auth_register_endpoint(request: Request) -> JSONResponse:
     try:
-        return JSONResponse(login(payload))
-    except DemoHTTPException as exc:
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        payload = await request.json()
+        validated = _parse_payload(RegisterOrganizationRequest, payload)
+    except (ValueError, TypeError, ValidationError) as exc:
+        return JSONResponse({'detail': str(exc).split('\n')[0] if isinstance(exc, ValidationError) else str(exc)}, status_code=400)
+
+    with SessionLocal() as db:
+        email = validated.email.lower().strip()
+        if db.execute(select(User).where(User.email == email)).scalar_one_or_none():
+            return JSONResponse({'detail': 'An account with that email already exists.'}, status_code=409)
+
+        if db.execute(select(Organization).where(Organization.name == validated.organization_name.strip())).scalar_one_or_none():
+            return JSONResponse({'detail': 'An organization with that name already exists.'}, status_code=409)
+
+        admin_role = get_role_by_name(db, RoleName.ADMIN)
+        if admin_role is None:
+            return JSONResponse({'detail': 'Admin role is not configured.'}, status_code=500)
+
+        organization = Organization(
+            name=validated.organization_name.strip(),
+            phone=validated.phone.strip() if validated.phone else None,
+        )
+        db.add(organization)
+        db.flush()
+
+        user = User(
+            organization_id=organization.id,
+            role_id=admin_role.id,
+            name=validated.admin_name.strip(),
+            email=email,
+            password_hash=hash_password(validated.password),
+            phone=validated.phone.strip() if validated.phone else None,
+        )
+        db.add(user)
+        db.commit()
+        return JSONResponse({'message': 'Workspace created.'}, status_code=201)
 
 
-async def register_worker_endpoint(request: Request) -> JSONResponse:
-    payload = await request.json()
+async def auth_login_endpoint(request: Request) -> JSONResponse:
     try:
-        return JSONResponse(register_worker(payload))
-    except DemoHTTPException as exc:
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        payload = await request.json()
+        email = payload.get('email', '').lower().strip()
+        password = payload.get('password', '')
+
+        if not email or not password:
+            return JSONResponse({'detail': 'Email and password are required.'}, status_code=400)
+
+        with SessionLocal() as db:
+            user = get_user_for_email(db, email)
+            if not user or not verify_password(password, user.password_hash):
+                return JSONResponse({'detail': 'Email or password is incorrect.'}, status_code=401)
+
+            if not user.is_active:
+                return JSONResponse({'detail': 'Account is disabled.'}, status_code=403)
+
+            token = create_session(db, user)
+            org = db.get(Organization, user.organization_id)
+            return JSONResponse({
+                'token': token,
+                'user': _serialize_user(user, org),
+                'role': user.role_ref.name if user.role_ref else 'WORKER',
+            })
+    except Exception as exc:
+        return JSONResponse({'detail': str(exc)}, status_code=400)
 
 
-async def workers_endpoint(request: Request) -> JSONResponse:
-    return JSONResponse(list_workers())
-
-
-async def verification_endpoint(request: Request) -> JSONResponse:
-    payload = await request.json()
+async def auth_me_endpoint(request: Request) -> JSONResponse:
     try:
-        return JSONResponse(verify_attendance(payload))
+        user, db = _require_auth(request)
+        try:
+            org = db.get(Organization, user.organization_id)
+            return JSONResponse(_serialize_user(user, org))
+        finally:
+            db.close()
     except DemoHTTPException as exc:
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        return JSONResponse({'detail': exc.detail}, status_code=exc.status_code)
 
 
-async def face_enrollment_endpoint(request: Request) -> JSONResponse:
-    payload = await request.json()
-    worker = next((item for item in workers_store if item["worker_id"] == payload.get("worker_id")), None)
-    if not worker:
-        return JSONResponse({"detail": "Worker not found"}, status_code=404)
-    worker["face_template"] = payload.get("face_template", "demo-template")
-    return JSONResponse({"worker_id": payload.get("worker_id"), "status": "enrolled"})
+async def auth_logout_endpoint(request: Request) -> JSONResponse:
+    token = _read_bearer_token(request)
+    if not token:
+        return JSONResponse({'detail': 'Authentication required.'}, status_code=401)
+
+    with SessionLocal() as db:
+        session_record = db.execute(select(AuthSession).where(AuthSession.token_hash == get_session_token_hash(token))).scalar_one_or_none()
+        if session_record:
+            db.delete(session_record)
+            db.commit()
+        return JSONResponse({'message': 'Logged out successfully.'})
 
 
-async def create_attendance_endpoint(request: Request) -> JSONResponse:
-    payload = await request.json()
+# --- Admin & Workspace Endpoints ---
+
+async def admin_dashboard_endpoint(request: Request) -> JSONResponse:
     try:
-        return JSONResponse(create_attendance(payload))
+        user, db = _require_role(request, {'ADMIN', 'SUPERVISOR'})
     except DemoHTTPException as exc:
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        return JSONResponse({'detail': exc.detail}, status_code=exc.status_code)
+
+    try:
+        organization = db.get(Organization, user.organization_id)
+        supervisors = db.execute(
+            select(User).where(User.organization_id == user.organization_id, User.role_ref.has(name=RoleName.SUPERVISOR.value))
+        ).scalars().all()
+        worksites = db.execute(select(Worksite).where(Worksite.organization_id == user.organization_id)).scalars().all()
+        users = db.execute(select(User).where(User.organization_id == user.organization_id)).scalars().all()
+
+        payload = {
+            'organization_name': organization.name if organization else None,
+            'supervisors': len(supervisors),
+            'worksites': len(worksites),
+            'users': len(users),
+            'role': user.role_ref.name if user.role_ref else 'WORKER',
+            'empty_state': 'Your workforce is ready to be set up.' if len(users) <= 1 else None,
+        }
+        return JSONResponse(payload)
+    finally:
+        db.close()
 
 
-async def today_attendance_endpoint(request: Request) -> JSONResponse:
-    return JSONResponse(get_today_attendance())
+async def admin_supervisors_endpoint(request: Request) -> JSONResponse:
+    if request.method == 'GET':
+        try:
+            user, db = _require_role(request, {'ADMIN', 'SUPERVISOR'})
+        except DemoHTTPException as exc:
+            return JSONResponse({'detail': exc.detail}, status_code=exc.status_code)
+
+        try:
+            rows = db.execute(
+                select(User).where(User.organization_id == user.organization_id).join(User.role_ref)
+            ).scalars().all()
+            output = []
+            for record in rows:
+                if record.role_ref and record.role_ref.name == RoleName.SUPERVISOR.value:
+                    assignments = db.execute(
+                        select(SupervisorWorksiteAssignment).where(SupervisorWorksiteAssignment.user_id == record.id)
+                    ).scalars().all()
+                    worksite_ids = [a.worksite_id for a in assignments]
+                    output.append({
+                        'id': record.id,
+                        'name': record.name,
+                        'email': record.email,
+                        'role': record.role_ref.name,
+                        'worksite_ids': worksite_ids,
+                    })
+            return JSONResponse(output)
+        finally:
+            db.close()
+
+    # POST create supervisor
+    try:
+        user, db = _require_role(request, {'ADMIN'})
+    except DemoHTTPException as exc:
+        return JSONResponse({'detail': exc.detail}, status_code=exc.status_code)
+
+    try:
+        payload = await request.json()
+        validated = _parse_payload(CreateSupervisorRequest, payload)
+    except (ValueError, TypeError, ValidationError) as exc:
+        db.close()
+        return JSONResponse({'detail': str(exc).split('\n')[0] if isinstance(exc, ValidationError) else str(exc)}, status_code=400)
+
+    try:
+        email = validated.email.lower().strip()
+        if db.execute(select(User).where(User.email == email)).scalar_one_or_none():
+            return JSONResponse({'detail': 'A supervisor with that email already exists.'}, status_code=409)
+
+        role = get_role_by_name(db, RoleName.SUPERVISOR)
+        if role is None:
+            return JSONResponse({'detail': 'Supervisor role is not configured.'}, status_code=500)
+
+        supervisor = User(
+            organization_id=user.organization_id,
+            role_id=role.id,
+            name=validated.full_name.strip(),
+            email=email,
+            password_hash=hash_password(validated.password),
+        )
+        db.add(supervisor)
+        db.flush()
+
+        for worksite_id in validated.worksite_ids:
+            worksite = db.get(Worksite, worksite_id)
+            if worksite and worksite.organization_id == user.organization_id:
+                db.add(SupervisorWorksiteAssignment(
+                    user_id=supervisor.id,
+                    worksite_id=worksite_id,
+                    organization_id=user.organization_id
+                ))
+        db.commit()
+        return JSONResponse({'message': 'Supervisor created.'}, status_code=201)
+    finally:
+        db.close()
 
 
-async def dashboard_stats_endpoint(request: Request) -> JSONResponse:
-    return JSONResponse(get_dashboard_stats())
+async def admin_worksites_endpoint(request: Request) -> JSONResponse:
+    try:
+        user, db = _require_role(request, {'ADMIN', 'SUPERVISOR'})
+    except DemoHTTPException as exc:
+        return JSONResponse({'detail': exc.detail}, status_code=exc.status_code)
+
+    try:
+        if request.method == 'GET':
+            rows = db.execute(
+                select(Worksite).where(Worksite.organization_id == user.organization_id)
+            ).scalars().all()
+            return JSONResponse([
+                {
+                    'id': r.id,
+                    'name': r.name,
+                    'description': r.description,
+                    'latitude': r.latitude,
+                    'longitude': r.longitude,
+                    'geofence_radius_meters': r.geofence_radius_meters,
+                    'active': r.active,
+                    'organization_id': r.organization_id,
+                }
+                for r in rows
+            ])
+
+        if request.method == 'POST':
+            if user.role_ref.name != 'ADMIN':
+                return JSONResponse({'detail': 'Only administrators can create worksites.'}, status_code=403)
+            payload = await request.json()
+            validated = _parse_payload(WorksiteCreate, payload)
+
+            ws = Worksite(
+                organization_id=user.organization_id,
+                name=validated.name.strip(),
+                description=validated.description.strip() if validated.description else None,
+                latitude=validated.latitude,
+                longitude=validated.longitude,
+                geofence_radius_meters=validated.geofence_radius_meters,
+                active=validated.active,
+            )
+            db.add(ws)
+            db.commit()
+            return JSONResponse({'message': 'Worksite created.', 'id': ws.id}, status_code=201)
+    finally:
+        db.close()
 
 
-async def sync_queue_endpoint(request: Request) -> JSONResponse:
-    payload = await request.json()
-    return JSONResponse(sync_queue(payload))
+async def admin_worksite_detail_endpoint(request: Request) -> JSONResponse:
+    try:
+        user, db = _require_role(request, {'ADMIN'})
+    except DemoHTTPException as exc:
+        return JSONResponse({'detail': exc.detail}, status_code=exc.status_code)
 
+    try:
+        worksite_id = int(request.path_params['worksite_id'])
+        ws = db.get(Worksite, worksite_id)
+        if not ws or ws.organization_id != user.organization_id:
+            return JSONResponse({'detail': 'Worksite not found.'}, status_code=404)
+
+        if request.method == 'PUT':
+            payload = await request.json()
+            validated = _parse_payload(WorksiteUpdate, payload)
+            ws.name = validated.name.strip()
+            ws.description = validated.description.strip() if validated.description else None
+            ws.latitude = validated.latitude
+            ws.longitude = validated.longitude
+            ws.geofence_radius_meters = validated.geofence_radius_meters
+            ws.active = validated.active
+            db.commit()
+            return JSONResponse({'message': 'Worksite updated.'})
+    finally:
+        db.close()
+
+
+async def route_403(request: Request) -> JSONResponse:
+    return JSONResponse({'detail': 'Access denied.'}, status_code=403)
+
+
+init_db()
 
 app = Starlette(
     routes=[
-        Route("/health", health, methods=["GET"]),
-        Route("/api/login", login_endpoint, methods=["POST"]),
-        Route("/api/workers/register", register_worker_endpoint, methods=["POST"]),
-        Route("/api/workers", workers_endpoint, methods=["GET"]),
-        Route("/api/verification", verification_endpoint, methods=["POST"]),
-        Route("/api/workers/enroll", face_enrollment_endpoint, methods=["POST"]),
-        Route("/api/attendance", create_attendance_endpoint, methods=["POST"]),
-        Route("/api/attendance/today", today_attendance_endpoint, methods=["GET"]),
-        Route("/api/dashboard/stats", dashboard_stats_endpoint, methods=["GET"]),
-        Route("/api/sync/queue", sync_queue_endpoint, methods=["POST"]),
+        Route('/health', health, methods=['GET']),
+        Route('/api/auth/register', auth_register_endpoint, methods=['POST']),
+        Route('/api/register', auth_register_endpoint, methods=['POST']),
+        Route('/api/auth/login', auth_login_endpoint, methods=['POST']),
+        Route('/api/login', auth_login_endpoint, methods=['POST']),
+        Route('/api/auth/me', auth_me_endpoint, methods=['GET']),
+        Route('/api/me', auth_me_endpoint, methods=['GET']),
+        Route('/api/auth/logout', auth_logout_endpoint, methods=['POST']),
+        Route('/api/logout', auth_logout_endpoint, methods=['POST']),
+        Route('/api/admin/dashboard', admin_dashboard_endpoint, methods=['GET']),
+        Route('/api/admin/supervisors', admin_supervisors_endpoint, methods=['GET', 'POST']),
+        Route('/api/admin/worksites', admin_worksites_endpoint, methods=['GET', 'POST']),
+        Route('/api/admin/worksites/{worksite_id:int}', admin_worksite_detail_endpoint, methods=['PUT']),
+        Route('/api/worksites', admin_worksites_endpoint, methods=['GET', 'POST']),
+        Route('/403', route_403, methods=['GET']),
     ],
     middleware=[
         Middleware(
             CORSMiddleware,
-            allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+            allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:3001'],
             allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
+            allow_methods=['*'],
+            allow_headers=['*'],
         )
     ],
 )
