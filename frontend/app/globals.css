@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  @apply min-h-screen bg-night text-mist antialiased;
+  background-image: radial-gradient(circle at top left, rgba(184, 212, 75, 0.08), transparent 32%);
+}
+
+* {
+  @apply border-[#243124];
+}
+
+::selection {
+  @apply bg-lime/30 text-mist;
+}
