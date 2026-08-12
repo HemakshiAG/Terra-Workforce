@@ -129,10 +129,24 @@ function TerminalClient() {
 
       const token = localStorage.getItem('terra-workforce-token');
 
-      // Capture real frame or use simulator tag if selected worker demands a specific error
+      // Capture real frame or use simulator tag if demo triggers are set
       let frameData = getFrameBase64();
-      
-      if (selectedWorkerId) {
+
+      if (localStorage.getItem('terra-demo-simulate-liveness-fail') === 'true') {
+        localStorage.removeItem('terra-demo-simulate-liveness-fail');
+        frameData = "fail_liveness";
+      } else if (localStorage.getItem('terra-demo-simulate-unknown') === 'true') {
+        localStorage.removeItem('terra-demo-simulate-unknown');
+        frameData = "fail_dark";
+      } else if (localStorage.getItem('terra-demo-simulate-low-confidence') === 'true') {
+        localStorage.removeItem('terra-demo-simulate-low-confidence');
+        if (selectedWorkerId) {
+          const selected = workers.find(w => w.id === selectedWorkerId);
+          if (selected) {
+            setSelectedWorkerId(selected.id);
+          }
+        }
+      } else if (selectedWorkerId) {
         const selected = workers.find(w => w.id === selectedWorkerId);
         if (selected && selected.full_name.toLowerCase().includes("blur")) {
           frameData = "fail_blur";

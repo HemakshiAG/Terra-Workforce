@@ -410,7 +410,7 @@ export default function DashboardPage() {
 
             {/* Timeline */}
             <div className="rounded border border-[#243124] bg-[#081209] p-5">
-              <h3 className="text-sm font-semibold uppercase tracking-widest text-lime mb-4">Today's Check-in Timeline</h3>
+              <h3 className="text-sm font-semibold uppercase tracking-widest text-lime mb-4">Today&apos;s Check-in Timeline</h3>
               <div className="divide-y divide-[#243124] max-h-60 overflow-y-auto pr-2">
                 {supervisorData.timeline.map((att) => (
                   <div key={att.id} className="py-3 flex justify-between text-sm">
@@ -435,7 +435,7 @@ export default function DashboardPage() {
             <div className="rounded border border-[#243124] bg-[#081209] p-5">
               <h3 className="text-sm font-semibold uppercase tracking-widest text-lime mb-2">Estimated Wages</h3>
               <p className="mt-2 text-3xl font-light text-mist">₹{supervisorData.estimated_wages.toLocaleString()}</p>
-              <p className="text-xs text-mist/50 mt-1">Accumulated for today's logs</p>
+              <p className="text-xs text-mist/50 mt-1">Accumulated for today&apos;s logs</p>
             </div>
 
             {/* Integrity Alerts */}
