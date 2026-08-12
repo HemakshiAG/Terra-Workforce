@@ -18,24 +18,36 @@ export default function ReportsPage() {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    const token = localStorage.getItem('terra-workforce-token');
-    if (!token) {
-      setIsLoading(false);
-      return;
-    }
-
     async function loadReports() {
       try {
-        const response = await fetch(`${API_BASE_URL}/api/attendance/today`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        if (!response.ok) {
-          throw new Error('Unable to load attendance reports');
+        const token = localStorage.getItem('terra-workforce-token');
+        if (token) {
+          const response = await fetch(`${API_BASE_URL}/api/attendance/today`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (response.ok) {
+            const data = await response.json();
+            setAttendance(Array.isArray(data) ? data : []);
+            setIsLoading(false);
+            return;
+          }
         }
-        const data = await response.json();
-        setAttendance(Array.isArray(data) ? data : []);
       } catch (error) {
-        console.error('Failed to load report data', error);
+        console.error('Failed to load report data from cloud', error);
+      }
+
+      // Offline Fallback: Read from Dexie
+      try {
+        const { db } = await import('@/lib/db');
+        const localRecords = await db.attendance_records.toArray();
+        setAttendance(localRecords.map(r => ({
+          id: String(r.id || r.local_id),
+          worker_id: r.worker_code || r.worker_name || 'W-101',
+          status: r.status === 'PRESENT' ? 'accepted' : r.status.toLowerCase(),
+          timestamp: r.check_in_at || new Date().toISOString()
+        })));
+      } catch (err) {
+        console.error(err);
       } finally {
         setIsLoading(false);
       }
@@ -44,10 +56,34 @@ export default function ReportsPage() {
     loadReports();
   }, []);
 
+  const handleExportCSV = async () => {
+    const { db } = await import('@/lib/db');
+    const records = await db.attendance_records.toArray();
+    const headers = ['ID', 'Worker Code', 'Worker Name', 'Status', 'Verification Method', 'Check-In Time', 'Sync Status'];
+    const rows = records.map(r => [
+      r.id || r.local_id,
+      r.worker_code || 'W-101',
+      r.worker_name || 'Worker',
+      r.status,
+      r.verification_method,
+      r.check_in_at || '',
+      r.sync_status
+    ]);
+
+    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement('a');
+    link.setAttribute('href', encodedUri);
+    link.setAttribute('download', `terra_attendance_report_${new Date().toISOString().split('T')[0]}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   const summary = useMemo(() => {
-    const verified = attendance.filter((item) => item.status === 'accepted').length;
-    const review = attendance.filter((item) => item.status === 'manual_review' || item.status === 'rejected').length;
-    const total = attendance.length;
+    const verified = attendance.filter((item) => item.status === 'accepted' || item.status === 'PRESENT').length;
+    const review = attendance.filter((item) => item.status === 'manual_review' || item.status === 'rejected' || item.status === 'PENDING_REVIEW').length;
+    const total = attendance.length || 1;
     const hours = verified * 8;
     const payout = verified * 8 * 180;
     return { verified, review, total, hours, payout };
@@ -56,7 +92,7 @@ export default function ReportsPage() {
   const alerts = useMemo(
     () =>
       attendance
-        .filter((item) => item.status === 'manual_review' || item.status === 'rejected')
+        .filter((item) => item.status === 'manual_review' || item.status === 'rejected' || item.status === 'PENDING_REVIEW')
         .slice(0, 3)
         .map((item) => ({
           title: item.status === 'rejected' ? 'Liveness or identity check failed' : 'Manual review requested',
@@ -67,6 +103,16 @@ export default function ReportsPage() {
 
   return (
     <AppShell title="Reports" subtitle="Operational and integrity reporting for supervisors and admins.">
+      <div className="flex justify-between items-center mb-6">
+        <p className="text-xs uppercase tracking-[0.3em] text-[#dfeab1]">Export & Analytics</p>
+        <button
+          onClick={handleExportCSV}
+          className="px-4 py-2 bg-[#b7cc75] text-[#0b0f0c] rounded text-xs font-bold hover:bg-[#cbe089] transition shadow-md"
+        >
+          Export CSV (Offline Supported)
+        </button>
+      </div>
+
       {isLoading ? <div className="rounded border border-[#243124] bg-[#081209] p-5 text-sm text-mist/70">Loading reports…</div> : null}
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
