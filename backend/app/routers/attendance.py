@@ -10,7 +10,7 @@ from backend.app.database import SessionLocal
 from backend.app.models import (
     AttendanceSession, AttemptResult, VerificationMethod, 
     AttendanceStatus, FaceMatchStatus, LivenessStatus, LocationStatus, RoleName,
-    Attendance, WorkerModel, VerificationAttempt, Worksite
+    Attendance, WorkerModel, VerificationAttempt, Worksite, SessionStatus
 )
 from backend.app.schemas_attendance import (
     AttendanceSessionCreate, VerificationAttemptRequest, 
@@ -443,5 +443,190 @@ async def list_attendance_endpoint(request: Request) -> JSONResponse:
                 'location_status': att.location_status,
             } for att in attendances
         ])
+    finally:
+        db.close()
+
+
+async def supervisor_dashboard_endpoint(request: Request) -> JSONResponse:
+    user, db, error_response = _require_role(request, {'ADMIN', 'SUPERVISOR'})
+    if error_response:
+        return error_response
+
+    try:
+        from sqlalchemy import func
+        from backend.app.models import WorkerModel, Attendance, VerificationAttempt, IntegrityAlertModel, WageRecordModel, AttendanceSession
+        
+        # 1. Total Workers in Organization
+        workers_count = db.query(func.count(WorkerModel.id)).filter(
+            WorkerModel.organization_id == user.organization_id,
+            WorkerModel.is_active == True
+        ).scalar() or 0
+
+        # 2. Present Workers today
+        present_count = db.query(func.count(Attendance.id)).filter(
+            Attendance.organization_id == user.organization_id,
+            func.date(Attendance.check_in_at) == date.today()
+        ).scalar() or 0
+
+        # 3. Absent workers today
+        absent_count = max(0, workers_count - present_count)
+
+        # 4. Pending Review
+        pending_count = db.query(func.count(VerificationAttempt.id)).filter(
+            VerificationAttempt.organization_id == user.organization_id,
+            VerificationAttempt.result == AttemptResult.PENDING_REVIEW.value
+        ).scalar() or 0
+
+        # 5. Integrity Alerts
+        alerts_count = db.query(func.count(IntegrityAlertModel.id)).scalar() or 0
+
+        # 6. Estimated Wages Today (present workers * 400.0 or from WageRecordModel sum)
+        wage_sum = db.query(func.sum(WageRecordModel.estimated_wage)).filter(
+            WageRecordModel.organization_id == user.organization_id
+        ).scalar()
+        estimated_wages = float(wage_sum) if wage_sum is not None else float(present_count * 400.0)
+
+        # 7. Active Session
+        active_sess = db.query(AttendanceSession).filter(
+            AttendanceSession.organization_id == user.organization_id,
+            AttendanceSession.status == SessionStatus.OPEN.value
+        ).first()
+
+        active_session_data = None
+        if active_sess:
+            active_session_data = {
+                'id': active_sess.id,
+                'session_type': active_sess.session_type,
+                'status': active_sess.status,
+                'worksite_name': active_sess.worksite.name if active_sess.worksite else "Unknown",
+                'actual_start': active_sess.actual_start.isoformat() if active_sess.actual_start else None
+            }
+
+        # 8. Today's check-in timeline (last 5 check-ins)
+        recent_checkins = db.query(Attendance).filter(
+            Attendance.organization_id == user.organization_id
+        ).order_by(Attendance.check_in_at.desc()).limit(5).all()
+
+        timeline = [
+            {
+                'id': att.id,
+                'worker_name': att.worker.full_name if att.worker else "Unknown",
+                'time': att.check_in_at.isoformat() if att.check_in_at else None,
+                'verification_method': att.verification_method
+            }
+            for att in recent_checkins
+        ]
+
+        # 9. Integrity Alerts List
+        alerts = db.query(IntegrityAlertModel).order_by(IntegrityAlertModel.created_at.desc()).limit(5).all()
+        alerts_list = [
+            {
+                'id': a.id,
+                'worker_id': a.worker_id,
+                'alert_type': a.alert_type,
+                'message': a.message,
+                'severity': a.severity,
+                'created_at': a.created_at.isoformat()
+            }
+            for a in alerts
+        ]
+
+        return JSONResponse({
+            'workers_today': workers_count,
+            'present': present_count,
+            'absent': absent_count,
+            'pending_review': pending_count,
+            'integrity_alerts': alerts_count,
+            'estimated_wages': estimated_wages,
+            'active_session': active_session_data,
+            'timeline': timeline,
+            'alerts': alerts_list
+        })
+    finally:
+        db.close()
+
+
+async def worker_dashboard_endpoint(request: Request) -> JSONResponse:
+    auth_result, error_response = _require_auth(request)
+    if error_response:
+        return error_response
+    user, db = auth_result
+
+    try:
+        from sqlalchemy import func
+        from backend.app.models import WorkerModel, Attendance, WageRecordModel, AttendanceSession
+        
+        # Enforce worker identity verification
+        worker = db.query(WorkerModel).filter(
+            WorkerModel.organization_id == user.organization_id,
+            (WorkerModel.phone == user.phone) | (WorkerModel.name == user.name)
+        ).first()
+
+        if not worker:
+            return JSONResponse({
+                'attendance_pct': 0.0,
+                'days_present': 0,
+                'hours_worked': 0.0,
+                'estimated_wages': 0.0,
+                'biometric_enrollment_status': 'NOT_STARTED',
+                'history': []
+            })
+
+        # Calculate metrics
+        days_present = db.query(func.count(Attendance.id)).filter(
+            Attendance.worker_id == worker.id,
+            Attendance.status == AttendanceStatus.PRESENT.value
+        ).scalar() or 0
+
+        total_sessions = db.query(func.count(AttendanceSession.id)).filter(
+            AttendanceSession.worksite_id == worker.worksite_id,
+            AttendanceSession.status == SessionStatus.CLOSED.value
+        ).scalar() or 0
+
+        attendance_pct = 100.0 if total_sessions == 0 else min(100.0, (days_present / total_sessions) * 100.0)
+
+        # Hours worked
+        all_attendance = db.query(Attendance).filter(Attendance.worker_id == worker.id).all()
+        total_seconds = 0.0
+        for att in all_attendance:
+            if att.check_in_at and att.check_out_at:
+                diff = (att.check_out_at - att.check_in_at).total_seconds()
+                # Subtract break duration
+                if att.break_start and att.break_end:
+                    b_diff = (att.break_end - att.break_start).total_seconds()
+                    if b_diff > 0:
+                        diff -= b_diff
+                if diff > 0:
+                    total_seconds += diff
+        hours_worked = round(total_seconds / 3600.0, 1)
+
+        # Wages
+        wages_val = db.query(func.sum(WageRecordModel.estimated_wage)).filter(
+            WageRecordModel.worker_id == str(worker.id)
+        ).scalar()
+        estimated_wages = float(wages_val) if wages_val is not None else float(days_present * 400.0)
+
+        # History list
+        history = [
+            {
+                'id': att.id,
+                'date': att.session.date.isoformat() if (att.session and att.session.date) else None,
+                'session_type': att.session.session_type if att.session else "Unknown",
+                'check_in_at': att.check_in_at.isoformat() if att.check_in_at else None,
+                'check_out_at': att.check_out_at.isoformat() if att.check_out_at else None,
+                'status': att.status,
+                'verification_method': att.verification_method,
+            }
+            for att in all_attendance
+        ]
+
+        return JSONResponse({
+            'attendance_pct': attendance_pct,
+            'days_present': days_present,
+            'hours_worked': hours_worked,
+            'estimated_wages': estimated_wages,
+            'biometric_enrollment_status': worker.biometric_enrollment_status,
+            'history': history
+        })
     finally:
         db.close()

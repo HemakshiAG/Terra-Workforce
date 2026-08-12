@@ -29,6 +29,7 @@ from backend.app.auth import (
 from backend.app.database import SessionLocal, init_db
 from backend.app.models import (
     AuthSession,
+    AuditLogModel,
     IntegrityAlertModel,
     Organization,
     Role,
@@ -75,6 +76,8 @@ from backend.app.routers.attendance import (
     get_reviews_endpoint,
     process_review_endpoint,
     list_attendance_endpoint,
+    supervisor_dashboard_endpoint,
+    worker_dashboard_endpoint,
 )
 
 
@@ -252,14 +255,31 @@ async def admin_dashboard_endpoint(request: Request) -> JSONResponse:
         ).scalars().all()
         worksites = db.execute(select(Worksite).where(Worksite.organization_id == user.organization_id)).scalars().all()
         users = db.execute(select(User).where(User.organization_id == user.organization_id)).scalars().all()
+        workers = db.execute(select(WorkerModel).where(WorkerModel.organization_id == user.organization_id)).scalars().all()
+        audit_logs = db.execute(
+            select(AuditLogModel)
+            .where(AuditLogModel.organization_id == user.organization_id)
+            .order_by(AuditLogModel.created_at.desc())
+            .limit(5)
+        ).scalars().all()
 
         payload = {
             'organization_name': organization.name if organization else None,
             'supervisors': len(supervisors),
             'worksites': len(worksites),
+            'workers': len(workers),
             'users': len(users),
             'role': user.role_ref.name if user.role_ref else 'WORKER',
             'empty_state': 'Your workforce is ready to be set up.' if len(users) <= 1 else None,
+            'audit_activity': [
+                {
+                    'id': log.id,
+                    'action': log.action,
+                    'target_type': log.target_type,
+                    'created_at': log.created_at.isoformat()
+                }
+                for log in audit_logs
+            ]
         }
         return JSONResponse(payload)
     finally:
@@ -463,6 +483,8 @@ app = Starlette(
         Route('/api/attendance/reviews', get_reviews_endpoint, methods=['GET']),
         Route('/api/attendance/reviews/{attempt_id:int}', process_review_endpoint, methods=['POST']),
         Route('/api/attendance', list_attendance_endpoint, methods=['GET']),
+        Route('/api/supervisor/dashboard', supervisor_dashboard_endpoint, methods=['GET']),
+        Route('/api/worker/dashboard', worker_dashboard_endpoint, methods=['GET']),
         Route('/403', route_403, methods=['GET']),
     ],
     middleware=[

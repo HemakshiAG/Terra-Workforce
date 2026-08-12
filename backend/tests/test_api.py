@@ -271,3 +271,66 @@ def test_database_persistence_after_restart():
         org = db.query(Organization).filter(Organization.id == user.organization_id).first()
         assert org is not None
         assert org.name == "Green Valley Farms"
+
+
+def test_dashboard_rbac():
+    # Login Admin
+    admin_login = client.post(
+        "/api/auth/login",
+        json={"email": "admin@greenvalley.com", "password": "Password123!"},
+    ).json()
+    admin_token = admin_login["token"]
+
+    # Login Supervisor
+    sup_login = client.post(
+        "/api/auth/login",
+        json={"email": "supervisor1@greenvalley.com", "password": "Password123!"},
+    ).json()
+    sup_token = sup_login["token"]
+
+    # 1. Admin/Supervisor can see admin dashboard
+    res = client.get("/api/admin/dashboard", headers={"Authorization": f"Bearer {admin_token}"})
+    assert res.status_code == 200
+    assert "workers" in res.json()
+
+    res = client.get("/api/admin/dashboard", headers={"Authorization": f"Bearer {sup_token}"})
+    assert res.status_code == 200
+
+    # 2. Admin/Supervisor can see supervisor dashboard
+    res = client.get("/api/supervisor/dashboard", headers={"Authorization": f"Bearer {sup_token}"})
+    assert res.status_code == 200
+    assert "workers_today" in res.json()
+
+    # 3. Worker dashboard access check with mock user
+    # Create worker user first in db
+    with SessionLocal() as db:
+        from backend.app.models import User, Role, RoleName
+        worker_role = db.query(Role).filter(Role.name == RoleName.WORKER.value).first()
+        worker_user = User(
+            organization_id=1,
+            role_id=worker_role.id,
+            name="Worker User",
+            email="worker@greenvalley.com",
+            password_hash=hash_password("Password123!"),
+            is_active=True
+        )
+        db.add(worker_user)
+        db.commit()
+
+    worker_login = client.post(
+        "/api/auth/login",
+        json={"email": "worker@greenvalley.com", "password": "Password123!"},
+    ).json()
+    worker_token = worker_login["token"]
+
+    # Worker can access worker dashboard
+    res = client.get("/api/worker/dashboard", headers={"Authorization": f"Bearer {worker_token}"})
+    assert res.status_code == 200
+
+    # Worker cannot access supervisor or admin dashboard
+    res = client.get("/api/supervisor/dashboard", headers={"Authorization": f"Bearer {worker_token}"})
+    assert res.status_code == 403
+
+    res = client.get("/api/admin/dashboard", headers={"Authorization": f"Bearer {worker_token}"})
+    assert res.status_code == 403
+
