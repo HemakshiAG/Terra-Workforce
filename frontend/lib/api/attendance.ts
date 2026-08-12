@@ -65,12 +65,14 @@ export interface PendingReview {
   session_id: number;
   worker_id: number;
   worker_name: string;
+  worker_code?: string;
   timestamp: string;
   verification_method: string;
   face_match_status: string;
   liveness_status: string;
   location_status: string;
   distance?: number;
+  distance_from_worksite?: number;
   result: string;
 }
 

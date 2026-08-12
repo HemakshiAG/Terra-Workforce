@@ -184,6 +184,16 @@ class AttendanceService:
         db.add(attempt)
         db.commit()
         db.refresh(attempt)
+
+        if attempt.worker_id:
+            try:
+                from backend.app.services.integrity import IntegrityService
+                IntegrityService.check_anomalies(
+                    db, attempt.worker_id, attempt.session_id, attempt.latitude, attempt.longitude
+                )
+            except Exception:
+                pass
+
         return attempt
 
     @staticmethod

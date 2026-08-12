@@ -390,6 +390,7 @@ class IntegrityAlertModel(Base):
     alert_type = Column(String(100), nullable=False)
     message = Column(Text, nullable=False)
     severity = Column(String(50), default='MEDIUM', nullable=False)
+    status = Column(String(50), default='OPEN', nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
 

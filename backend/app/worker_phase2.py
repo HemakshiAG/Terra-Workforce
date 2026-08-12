@@ -671,6 +671,32 @@ async def enrollment_complete_endpoint(request: Request) -> JSONResponse:
                     embedding = RecognitionService.generate_embedding(encoded)
                     if embedding:
                         worker.face_template = json.dumps(embedding)
+                        # Check duplicate identity similarity
+                        active_workers = db.query(WorkerModel).filter(
+                            WorkerModel.organization_id == user.organization_id,
+                            WorkerModel.id != worker.id,
+                            WorkerModel.face_template.isnot(None)
+                        ).all()
+                        
+                        enrolled_workers = {}
+                        for w in active_workers:
+                            try:
+                                emb = json.loads(w.face_template)
+                                if isinstance(emb, list) and len(emb) == 512:
+                                    enrolled_workers[w.id] = emb
+                            except Exception:
+                                continue
+                                
+                        matched_id, score = RecognitionService.find_nearest_candidate(embedding, enrolled_workers)
+                        if matched_id is not None and score >= 0.85:
+                            from backend.app.services.integrity import IntegrityService
+                            IntegrityService.create_alert(
+                                db,
+                                worker_id=str(worker.id),
+                                alert_type="Duplicate identity",
+                                message="Biometric enrollment resembles an existing worker.",
+                                severity="HIGH"
+                            )
             except Exception as e:
                 pass
 

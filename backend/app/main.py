@@ -78,6 +78,8 @@ from backend.app.routers.attendance import (
     list_attendance_endpoint,
     supervisor_dashboard_endpoint,
     worker_dashboard_endpoint,
+    get_integrity_alerts_endpoint,
+    update_alert_status_endpoint,
 )
 
 
@@ -485,6 +487,8 @@ app = Starlette(
         Route('/api/attendance', list_attendance_endpoint, methods=['GET']),
         Route('/api/supervisor/dashboard', supervisor_dashboard_endpoint, methods=['GET']),
         Route('/api/worker/dashboard', worker_dashboard_endpoint, methods=['GET']),
+        Route('/api/integrity/alerts', get_integrity_alerts_endpoint, methods=['GET']),
+        Route('/api/integrity/alerts/{alert_id:int}/status', update_alert_status_endpoint, methods=['POST']),
         Route('/403', route_403, methods=['GET']),
     ],
     middleware=[

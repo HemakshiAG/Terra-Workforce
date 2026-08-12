@@ -630,3 +630,67 @@ async def worker_dashboard_endpoint(request: Request) -> JSONResponse:
         })
     finally:
         db.close()
+
+
+async def get_integrity_alerts_endpoint(request: Request) -> JSONResponse:
+    user, db, error_response = _require_role(request, {'ADMIN', 'SUPERVISOR'})
+    if error_response:
+        return error_response
+
+    try:
+        from backend.app.models import IntegrityAlertModel, WorkerModel
+        alerts = db.query(IntegrityAlertModel).join(
+            WorkerModel, WorkerModel.id == IntegrityAlertModel.worker_id
+        ).filter(WorkerModel.organization_id == user.organization_id).order_by(IntegrityAlertModel.created_at.desc()).all()
+
+        return JSONResponse([
+            {
+                'id': a.id,
+                'worker_id': a.worker_id,
+                'worker_name': db.query(WorkerModel.full_name).filter(WorkerModel.id == a.worker_id).scalar() or "Unknown",
+                'alert_type': a.alert_type,
+                'message': a.message,
+                'severity': a.severity,
+                'status': a.status,
+                'created_at': a.created_at.isoformat()
+            }
+            for a in alerts
+        ])
+    finally:
+        db.close()
+
+
+async def update_alert_status_endpoint(request: Request) -> JSONResponse:
+    user, db, error_response = _require_role(request, {'ADMIN', 'SUPERVISOR'})
+    if error_response:
+        return error_response
+
+    alert_id = int(request.path_params['alert_id'])
+    try:
+        from backend.app.models import IntegrityAlertModel, WorkerModel
+        alert = db.query(IntegrityAlertModel).join(
+            WorkerModel, WorkerModel.id == IntegrityAlertModel.worker_id
+        ).filter(
+            WorkerModel.organization_id == user.organization_id,
+            IntegrityAlertModel.id == alert_id
+        ).first()
+
+        if not alert:
+            return JSONResponse({'detail': 'Alert not found.'}, status_code=404)
+
+        body = await request.json()
+        new_status = body.get('status')
+        if new_status not in {'OPEN', 'ACKNOWLEDGED', 'RESOLVED', 'DISMISSED'}:
+            return JSONResponse({'detail': 'Invalid alert status.'}, status_code=400)
+
+        alert.status = new_status
+        db.commit()
+        return JSONResponse({
+            'message': 'Alert status updated.',
+            'alert': {
+                'id': alert.id,
+                'status': alert.status
+            }
+        })
+    finally:
+        db.close()

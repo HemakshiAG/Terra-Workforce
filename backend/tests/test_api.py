@@ -334,3 +334,111 @@ def test_dashboard_rbac():
     res = client.get("/api/admin/dashboard", headers={"Authorization": f"Bearer {worker_token}"})
     assert res.status_code == 403
 
+
+def test_integrity_rules():
+    # Login Admin/Supervisor
+    sup_login = client.post(
+        "/api/auth/login",
+        json={"email": "supervisor1@greenvalley.com", "password": "Password123!"},
+    ).json()
+    sup_token = sup_login["token"]
+
+    # Run integrity simulation inside a single DB transaction
+    with SessionLocal() as db:
+        from backend.app.models import IntegrityAlertModel, WorkerModel, VerificationAttempt, FaceMatchStatus, LivenessStatus, LocationStatus, AttendanceSession
+        from datetime import date, datetime, timezone
+        
+        # Create worker
+        worker = WorkerModel(
+            organization_id=1,
+            worksite_id=1,
+            worker_id="W_UNIQUE_001",
+            worker_code="W001",
+            name="Test Worker 01",
+            full_name="Test Worker 01",
+            role="FIELD_WORKER",
+            status="ACTIVE",
+            is_active=True
+        )
+        db.add(worker)
+        db.commit()
+        db.refresh(worker)
+
+        # Create session
+        session = AttendanceSession(
+            organization_id=1,
+            worksite_id=1,
+            created_by=1,
+            session_type="MORNING",
+            date=date.today(),
+            scheduled_start=datetime.now(timezone.utc),
+            scheduled_end=datetime.now(timezone.utc),
+            status="OPEN"
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+
+        # 1. Trigger Geofence alert
+        from backend.app.services.integrity import IntegrityService
+        IntegrityService.check_anomalies(db, worker_id=worker.id, session_id=session.id, lat=22.3, lon=70.4) # outside geofence
+        
+        alerts = db.query(IntegrityAlertModel).filter(IntegrityAlertModel.worker_id == str(worker.id)).all()
+        assert len(alerts) > 0
+        assert any(a.alert_type == "Geofence violation" for a in alerts)
+
+        # 2. Trigger Repeated low-confidence match alert
+        for _ in range(3):
+            attempt = VerificationAttempt(
+                session_id=session.id,
+                worker_id=worker.id,
+                verification_method="FACE",
+                face_match_status=FaceMatchStatus.LOW_CONFIDENCE.value,
+                liveness_status=LivenessStatus.PASSED.value,
+                location_status=LocationStatus.WITHIN_GEOFENCE.value,
+                result="SUCCESS",
+                organization_id=1
+            )
+            db.add(attempt)
+        db.commit()
+        IntegrityService.check_anomalies(db, worker_id=worker.id, session_id=session.id)
+        
+        alerts = db.query(IntegrityAlertModel).filter(IntegrityAlertModel.worker_id == str(worker.id)).all()
+        assert any(a.alert_type == "Repeated low-confidence matches" for a in alerts)
+
+        # 3. Trigger Repeated liveness failures
+        for _ in range(4):
+            attempt = VerificationAttempt(
+                session_id=session.id,
+                worker_id=worker.id,
+                verification_method="FACE",
+                face_match_status=FaceMatchStatus.MATCHED.value,
+                liveness_status=LivenessStatus.FAILED.value,
+                location_status=LocationStatus.WITHIN_GEOFENCE.value,
+                result="FAILED",
+                organization_id=1
+            )
+            db.add(attempt)
+        db.commit()
+        IntegrityService.check_anomalies(db, worker_id=worker.id, session_id=session.id)
+        
+        alerts = db.query(IntegrityAlertModel).filter(IntegrityAlertModel.worker_id == str(worker.id)).all()
+        assert any(a.alert_type == "Repeated liveness failures" for a in alerts)
+
+    # 4. Fetch alerts endpoint
+    res = client.get("/api/integrity/alerts", headers={"Authorization": f"Bearer {sup_token}"})
+    assert res.status_code == 200
+    alert_list = res.json()
+    assert len(alert_list) > 0
+    first_alert_id = alert_list[0]["id"]
+
+    # 5. Lifecycle status update (OPEN -> ACKNOWLEDGED)
+    update_res = client.post(
+        f"/api/integrity/alerts/{first_alert_id}/status",
+        headers={"Authorization": f"Bearer {sup_token}"},
+        json={"status": "ACKNOWLEDGED"}
+    )
+    assert update_res.status_code == 200
+    assert update_res.json()["alert"]["status"] == "ACKNOWLEDGED"
+
+
