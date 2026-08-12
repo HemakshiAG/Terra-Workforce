@@ -69,6 +69,12 @@ from backend.app.routers.attendance import (
     check_out_endpoint,
     generate_qr_endpoint,
     verify_qr_endpoint,
+    break_start_endpoint,
+    break_end_endpoint,
+    manual_attendance_endpoint,
+    get_reviews_endpoint,
+    process_review_endpoint,
+    list_attendance_endpoint,
 )
 
 
@@ -451,6 +457,12 @@ app = Starlette(
         Route('/api/attendance/check-out', check_out_endpoint, methods=['POST']),
         Route('/api/attendance/qr/generate', generate_qr_endpoint, methods=['POST']),
         Route('/api/attendance/qr/verify', verify_qr_endpoint, methods=['POST']),
+        Route('/api/attendance/break-start', break_start_endpoint, methods=['POST']),
+        Route('/api/attendance/break-end', break_end_endpoint, methods=['POST']),
+        Route('/api/attendance/manual', manual_attendance_endpoint, methods=['POST']),
+        Route('/api/attendance/reviews', get_reviews_endpoint, methods=['GET']),
+        Route('/api/attendance/reviews/{attempt_id:int}', process_review_endpoint, methods=['POST']),
+        Route('/api/attendance', list_attendance_endpoint, methods=['GET']),
         Route('/403', route_403, methods=['GET']),
     ],
     middleware=[

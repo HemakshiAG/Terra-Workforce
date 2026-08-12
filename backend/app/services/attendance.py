@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
@@ -6,9 +7,10 @@ from sqlalchemy.orm import Session
 from backend.app.models import (
     AttendanceSession, Attendance, VerificationAttempt, WorkerModel, Worksite,
     SessionStatus, AttemptResult, AttendanceStatus, FaceMatchStatus, 
-    LivenessStatus, LocationStatus, VerificationMethod
+    LivenessStatus, LocationStatus, VerificationMethod, BiometricEnrollmentStatus
 )
-from backend.app.services.verification import LocationService, DemoRecognitionService
+from backend.app.services.verification import VerificationService, QRCodeService
+from backend.app.services.geofence import GeofenceService
 
 
 class SessionService:
@@ -59,7 +61,7 @@ class AttendanceService:
     def process_verification_attempt(
         db: Session, 
         session_id: int, 
-        worker_id: int, 
+        worker_id: Optional[int], 
         verification_method: VerificationMethod,
         face_image_data: Optional[str] = None,
         lat: Optional[float] = None,
@@ -67,11 +69,10 @@ class AttendanceService:
         is_qr: bool = False
     ) -> VerificationAttempt:
         session = db.query(AttendanceSession).filter(AttendanceSession.id == session_id).first()
-        worker = db.query(WorkerModel).filter(WorkerModel.id == worker_id).first()
-        worksite = db.query(Worksite).filter(Worksite.id == session.worksite_id).first()
+        worksite = db.query(Worksite).filter(Worksite.id == session.worksite_id).first() if session else None
 
         attempt = VerificationAttempt(
-            organization_id=session.organization_id,
+            organization_id=session.organization_id if session else 1,
             session_id=session_id,
             worker_id=worker_id,
             verification_method=verification_method.value,
@@ -87,66 +88,98 @@ class AttendanceService:
             db.refresh(attempt)
             return attempt
 
-        if not worker or not worker.is_active:
-            attempt.result = AttemptResult.FAILED.value
-            attempt.failure_reason = "WORKER_INACTIVE"
-            db.add(attempt)
-            db.commit()
-            db.refresh(attempt)
-            return attempt
+        # If worker is pre-specified, validate active status
+        if worker_id:
+            worker = db.query(WorkerModel).filter(WorkerModel.id == worker_id).first()
+            if not worker or not worker.is_active:
+                attempt.result = AttemptResult.FAILED.value
+                attempt.failure_reason = "WORKER_INACTIVE"
+                db.add(attempt)
+                db.commit()
+                db.refresh(attempt)
+                return attempt
 
-        # Check existing attendance
-        existing_attendance = db.query(Attendance).filter(
-            Attendance.session_id == session_id,
-            Attendance.worker_id == worker_id
-        ).first()
+            # Enforce biometric enrollment check for face verification
+            if not is_qr and worker.biometric_enrollment_status != BiometricEnrollmentStatus.COMPLETED.value:
+                attempt.result = AttemptResult.FAILED.value
+                attempt.failure_reason = "BIOMETRIC_ENROLLMENT_INCOMPLETE"
+                db.add(attempt)
+                db.commit()
+                db.refresh(attempt)
+                return attempt
 
-        if existing_attendance:
-            attempt.result = AttemptResult.FAILED.value
-            attempt.failure_reason = "DUPLICATE_ATTENDANCE"
-            db.add(attempt)
-            db.commit()
-            db.refresh(attempt)
-            return attempt
-
-        # Location Check
-        loc_status, dist = LocationService.verify_location(lat, lon, worksite.latitude, worksite.longitude, worksite.geofence_radius_meters)
-        attempt.location_status = loc_status.value
-        attempt.distance_from_worksite = dist
+            # Check duplicate check-in
+            existing = db.query(Attendance).filter(
+                Attendance.session_id == session_id,
+                Attendance.worker_id == worker_id
+            ).first()
+            if existing:
+                attempt.result = AttemptResult.FAILED.value
+                attempt.failure_reason = "DUPLICATE_ATTENDANCE"
+                db.add(attempt)
+                db.commit()
+                db.refresh(attempt)
+                return attempt
 
         if is_qr:
-            # QR flow skips biometric check
+            # QR flow
+            # Geofence location check
+            loc_status, dist = GeofenceService.verify_location(
+                lat, lon, worksite.latitude, worksite.longitude, worksite.geofence_radius_meters
+            )
+            attempt.location_status = loc_status.value
+            attempt.distance_from_worksite = dist
             attempt.face_match_status = FaceMatchStatus.NOT_ATTEMPTED.value
             attempt.liveness_status = LivenessStatus.NOT_ATTEMPTED.value
             
             if loc_status == LocationStatus.OUTSIDE_GEOFENCE:
                 attempt.result = AttemptResult.FAILED.value
                 attempt.failure_reason = "OUTSIDE_GEOFENCE"
+            elif loc_status == LocationStatus.UNAVAILABLE:
+                attempt.result = AttemptResult.FAILED.value
+                attempt.failure_reason = "LOCATION_UNAVAILABLE"
             else:
                 attempt.result = AttemptResult.SUCCESS.value
         else:
-            # Biometric flow
-            face_status = DemoRecognitionService.verify_face(face_image_data, worker)
-            live_status = DemoRecognitionService.verify_liveness(face_image_data)
+            # Biometric pipeline
+            res, reason, face_s, live_s, loc_s, dist, matched_id, confidence = VerificationService.verify_pipeline(
+                db=db,
+                image_data=face_image_data,
+                worker_id=worker_id,
+                organization_id=session.organization_id,
+                worksite_lat=worksite.latitude,
+                worksite_lon=worksite.longitude,
+                geofence_radius=worksite.geofence_radius_meters,
+                worker_lat=lat,
+                worker_lon=lon
+            )
 
-            attempt.face_match_status = face_status.value
-            attempt.liveness_status = live_status.value
-
-            if face_status != FaceMatchStatus.MATCHED:
-                if face_status == FaceMatchStatus.LOW_CONFIDENCE:
-                    attempt.result = AttemptResult.PENDING_REVIEW.value
-                    attempt.failure_reason = "LOW_CONFIDENCE"
-                else:
+            # Assign resolved worker_id if it was not provided
+            if matched_id:
+                attempt.worker_id = matched_id
+                # Check duplicate again for matched worker
+                existing = db.query(Attendance).filter(
+                    Attendance.session_id == session_id,
+                    Attendance.worker_id == matched_id
+                ).first()
+                if existing:
                     attempt.result = AttemptResult.FAILED.value
-                    attempt.failure_reason = "NO_MATCH"
-            elif live_status != LivenessStatus.PASSED:
-                attempt.result = AttemptResult.FAILED.value
-                attempt.failure_reason = "LIVENESS_FAILED"
-            elif loc_status == LocationStatus.OUTSIDE_GEOFENCE:
-                attempt.result = AttemptResult.FAILED.value
-                attempt.failure_reason = "OUTSIDE_GEOFENCE"
-            else:
-                attempt.result = AttemptResult.SUCCESS.value
+                    attempt.failure_reason = "DUPLICATE_ATTENDANCE"
+                    attempt.face_match_status = face_s.value
+                    attempt.liveness_status = live_s.value
+                    attempt.location_status = loc_s.value
+                    attempt.distance_from_worksite = dist
+                    db.add(attempt)
+                    db.commit()
+                    db.refresh(attempt)
+                    return attempt
+
+            attempt.result = res.value
+            attempt.failure_reason = reason
+            attempt.face_match_status = face_s.value
+            attempt.liveness_status = live_s.value
+            attempt.location_status = loc_s.value
+            attempt.distance_from_worksite = dist
 
         db.add(attempt)
         db.commit()
@@ -157,6 +190,18 @@ class AttendanceService:
     def record_attendance(db: Session, attempt: VerificationAttempt) -> Optional[Attendance]:
         if attempt.result != AttemptResult.SUCCESS.value:
             return None
+
+        # Double check worker presence
+        if not attempt.worker_id:
+            return None
+
+        # Check existing attendance to prevent duplication
+        existing = db.query(Attendance).filter(
+            Attendance.session_id == attempt.session_id,
+            Attendance.worker_id == attempt.worker_id
+        ).first()
+        if existing:
+            return existing
 
         attendance = Attendance(
             organization_id=attempt.organization_id,
@@ -176,6 +221,30 @@ class AttendanceService:
         db.add(attendance)
         db.commit()
         db.refresh(attendance)
+        return attendance
+
+    @staticmethod
+    def record_break_start(db: Session, session_id: int, worker_id: int) -> Optional[Attendance]:
+        attendance = db.query(Attendance).filter(
+            Attendance.session_id == session_id,
+            Attendance.worker_id == worker_id
+        ).first()
+        if attendance and not attendance.break_start:
+            attendance.break_start = datetime.now(timezone.utc)
+            db.commit()
+            db.refresh(attendance)
+        return attendance
+
+    @staticmethod
+    def record_break_end(db: Session, session_id: int, worker_id: int) -> Optional[Attendance]:
+        attendance = db.query(Attendance).filter(
+            Attendance.session_id == session_id,
+            Attendance.worker_id == worker_id
+        ).first()
+        if attendance and attendance.break_start and not attendance.break_end:
+            attendance.break_end = datetime.now(timezone.utc)
+            db.commit()
+            db.refresh(attendance)
         return attendance
 
     @staticmethod

@@ -1,15 +1,16 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Any, Optional
 
-from pydantic import ValidationError
+from pydantic import ValidationError, BaseModel
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from backend.app.database import SessionLocal
 from backend.app.models import (
     AttendanceSession, AttemptResult, VerificationMethod, 
-    AttendanceStatus, FaceMatchStatus, LivenessStatus, LocationStatus, RoleName
+    AttendanceStatus, FaceMatchStatus, LivenessStatus, LocationStatus, RoleName,
+    Attendance, WorkerModel, VerificationAttempt, Worksite
 )
 from backend.app.schemas_attendance import (
     AttendanceSessionCreate, VerificationAttemptRequest, 
@@ -17,7 +18,18 @@ from backend.app.schemas_attendance import (
 )
 from backend.app.services.attendance import SessionService, AttendanceService
 from backend.app.services.verification import QRCodeService
-from backend.app.worker_phase2 import _require_auth, _require_role, _parse_payload, _utc_now
+from backend.app.worker_phase2 import _require_auth, _require_role, _parse_payload, _utc_now, _audit
+
+
+class ManualAttendanceRequest(BaseModel):
+    session_id: int
+    worker_id: int
+    reason: str
+
+
+class ReviewDecisionRequest(BaseModel):
+    action: str  # APPROVE, REJECT, RECAPTURE
+    reason: Optional[str] = None
 
 
 async def create_session_endpoint(request: Request) -> JSONResponse:
@@ -85,16 +97,16 @@ async def close_session_endpoint(request: Request) -> JSONResponse:
         db.close()
 
 async def verify_attendance_endpoint(request: Request) -> JSONResponse:
-    auth_result, _ = _require_auth(request)
-    if not auth_result:
-        # allow public access if no auth for kiosk, but let's assume auth is needed
-        pass
+    auth_result, error_response = _require_auth(request)
+    if error_response:
+        return error_response
+    user, db = auth_result
     
     try:
-        db = SessionLocal()
         payload = await request.json()
         validated = _parse_payload(VerificationAttemptRequest, payload)
     except Exception as exc:
+        db.close()
         return JSONResponse({'detail': str(exc)}, status_code=400)
         
     try:
@@ -122,7 +134,6 @@ async def check_in_endpoint(request: Request) -> JSONResponse:
         payload = await request.json()
         validated = _parse_payload(CheckInRequest, payload)
         
-        from backend.app.models import VerificationAttempt
         attempt = db.query(VerificationAttempt).filter(VerificationAttempt.id == validated.verification_attempt_id).first()
         if not attempt:
             return JSONResponse({'detail': 'Attempt not found'}, status_code=404)
@@ -189,5 +200,248 @@ async def verify_qr_endpoint(request: Request) -> JSONResponse:
         })
     except Exception as exc:
         return JSONResponse({'detail': str(exc)}, status_code=400)
+    finally:
+        db.close()
+
+# --- NEW PHASE 4 ENDPOINTS ---
+
+async def break_start_endpoint(request: Request) -> JSONResponse:
+    auth_result, error_response = _require_auth(request)
+    if error_response:
+        return error_response
+    user, db = auth_result
+    try:
+        payload = await request.json()
+        session_id = payload.get('session_id')
+        worker_id = payload.get('worker_id')
+        attendance = AttendanceService.record_break_start(db, session_id, worker_id)
+        if not attendance:
+            return JSONResponse({'detail': 'Active attendance record not found'}, status_code=404)
+        return JSONResponse({'id': attendance.id, 'break_start': str(attendance.break_start)})
+    except Exception as exc:
+        return JSONResponse({'detail': str(exc)}, status_code=400)
+    finally:
+        db.close()
+
+async def break_end_endpoint(request: Request) -> JSONResponse:
+    auth_result, error_response = _require_auth(request)
+    if error_response:
+        return error_response
+    user, db = auth_result
+    try:
+        payload = await request.json()
+        session_id = payload.get('session_id')
+        worker_id = payload.get('worker_id')
+        attendance = AttendanceService.record_break_end(db, session_id, worker_id)
+        if not attendance:
+            return JSONResponse({'detail': 'Active break or attendance record not found'}, status_code=404)
+        return JSONResponse({'id': attendance.id, 'break_end': str(attendance.break_end)})
+    except Exception as exc:
+        return JSONResponse({'detail': str(exc)}, status_code=400)
+    finally:
+        db.close()
+
+async def manual_attendance_endpoint(request: Request) -> JSONResponse:
+    user, db, error_response = _require_role(request, {'ADMIN', 'SUPERVISOR'})
+    if error_response:
+        return error_response
+    try:
+        payload = await request.json()
+        validated = _parse_payload(ManualAttendanceRequest, payload)
+        
+        # Check active status of worker
+        worker = db.query(WorkerModel).filter(WorkerModel.id == validated.worker_id).first()
+        if not worker or not worker.is_active:
+            return JSONResponse({'detail': 'Worker is inactive or not found'}, status_code=400)
+
+        # Create VerificationAttempt
+        attempt = VerificationAttempt(
+            organization_id=user.organization_id,
+            session_id=validated.session_id,
+            worker_id=validated.worker_id,
+            verification_method=VerificationMethod.MANUAL.value,
+            result=AttemptResult.SUCCESS.value,
+            face_match_status=FaceMatchStatus.NOT_ATTEMPTED.value,
+            liveness_status=LivenessStatus.NOT_ATTEMPTED.value,
+            location_status=LocationStatus.NOT_ATTEMPTED.value,
+            failure_reason="MANUAL_OVERRIDE"
+        )
+        db.add(attempt)
+        db.flush()
+
+        attendance = Attendance(
+            organization_id=user.organization_id,
+            session_id=validated.session_id,
+            worker_id=validated.worker_id,
+            status=AttendanceStatus.PRESENT.value,
+            verification_method=VerificationMethod.MANUAL.value,
+            check_in_at=datetime.now(timezone.utc),
+            face_match_status=FaceMatchStatus.NOT_ATTEMPTED.value,
+            liveness_status=LivenessStatus.NOT_ATTEMPTED.value,
+            location_status=LocationStatus.NOT_ATTEMPTED.value,
+            verification_attempt_id=attempt.id
+        )
+        db.add(attendance)
+        
+        _audit(
+            db,
+            organization_id=user.organization_id,
+            actor_user_id=user.id,
+            action='MANUAL_ATTENDANCE_MARKED',
+            target_type='worker',
+            target_id=str(validated.worker_id),
+            worker_id=validated.worker_id,
+            metadata={'reason': validated.reason, 'session_id': validated.session_id}
+        )
+        db.commit()
+        return JSONResponse({'id': attendance.id, 'status': attendance.status, 'verification_method': attendance.verification_method})
+    except Exception as exc:
+        return JSONResponse({'detail': str(exc)}, status_code=400)
+    finally:
+        db.close()
+
+async def get_reviews_endpoint(request: Request) -> JSONResponse:
+    user, db, error_response = _require_role(request, {'ADMIN', 'SUPERVISOR'})
+    if error_response:
+        return error_response
+    try:
+        attempts = db.query(VerificationAttempt).filter(
+            VerificationAttempt.organization_id == user.organization_id,
+            VerificationAttempt.result == AttemptResult.PENDING_REVIEW.value
+        ).all()
+        
+        return JSONResponse([
+            {
+                'id': a.id,
+                'session_id': a.session_id,
+                'worker_id': a.worker_id,
+                'worker_name': a.worker.full_name if a.worker else "Unknown",
+                'timestamp': a.timestamp.isoformat(),
+                'verification_method': a.verification_method,
+                'face_match_status': a.face_match_status,
+                'liveness_status': a.liveness_status,
+                'location_status': a.location_status,
+                'distance': a.distance_from_worksite,
+                'result': a.result
+            } for a in attempts
+        ])
+    finally:
+        db.close()
+
+async def process_review_endpoint(request: Request) -> JSONResponse:
+    user, db, error_response = _require_role(request, {'ADMIN', 'SUPERVISOR'})
+    if error_response:
+        return error_response
+    try:
+        attempt_id = int(request.path_params['attempt_id'])
+        payload = await request.json()
+        validated = _parse_payload(ReviewDecisionRequest, payload)
+
+        attempt = db.query(VerificationAttempt).filter(VerificationAttempt.id == attempt_id).first()
+        if not attempt or attempt.organization_id != user.organization_id:
+            return JSONResponse({'detail': 'Verification attempt not found'}, status_code=404)
+
+        if attempt.result != AttemptResult.PENDING_REVIEW.value:
+            return JSONResponse({'detail': 'Attempt has already been processed'}, status_code=400)
+
+        original_result = attempt.result
+
+        if validated.action == 'APPROVE':
+            attempt.result = AttemptResult.SUCCESS.value
+            attendance = AttendanceService.record_attendance(db, attempt)
+            if attendance:
+                attendance.status = AttendanceStatus.PRESENT.value
+        else:
+            attempt.result = AttemptResult.FAILED.value
+            attempt.failure_reason = "REVIEW_REJECTED" if validated.action == 'REJECT' else "REVIEW_RECAPTURE"
+
+        _audit(
+            db,
+            organization_id=user.organization_id,
+            actor_user_id=user.id,
+            action=f'REVIEW_DECISION_{validated.action}',
+            target_type='verification_attempt',
+            target_id=str(attempt_id),
+            worker_id=attempt.worker_id,
+            metadata={
+                'decision': validated.action,
+                'reason': validated.reason,
+                'original_result': original_result
+            }
+        )
+        db.commit()
+        return JSONResponse({'id': attempt.id, 'result': attempt.result})
+    except Exception as exc:
+        return JSONResponse({'detail': str(exc)}, status_code=400)
+    finally:
+        db.close()
+
+async def list_attendance_endpoint(request: Request) -> JSONResponse:
+    auth_result, error_response = _require_auth(request)
+    if error_response:
+        return error_response
+    user, db = auth_result
+    
+    try:
+        query = db.query(Attendance).filter(Attendance.organization_id == user.organization_id)
+        
+        # Enforce RBAC/Worker view isolation
+        role_str = user.role_ref.name if user.role_ref else 'WORKER'
+        if role_str == 'WORKER':
+            worker_record = db.query(WorkerModel).filter(
+                WorkerModel.organization_id == user.organization_id,
+                (WorkerModel.phone == user.phone) | (WorkerModel.name == user.name)
+            ).first()
+            if not worker_record:
+                return JSONResponse([])
+            query = query.filter(Attendance.worker_id == worker_record.id)
+        else:
+            # Supervisors/Admins can filter
+            session_id = request.query_params.get('session_id')
+            worksite_id = request.query_params.get('worksite_id')
+            status = request.query_params.get('status')
+            date_filter = request.query_params.get('date')
+            search = request.query_params.get('search')
+            
+            if session_id:
+                query = query.filter(Attendance.session_id == int(session_id))
+            if worksite_id:
+                query = query.join(AttendanceSession).filter(AttendanceSession.worksite_id == int(worksite_id))
+            if status:
+                query = query.filter(Attendance.status == status)
+            if date_filter:
+                try:
+                    dt = datetime.strptime(date_filter, "%Y-%m-%d").date()
+                    query = query.join(AttendanceSession).filter(AttendanceSession.date == dt)
+                except ValueError:
+                    pass
+            if search:
+                query = query.join(WorkerModel).filter(
+                    (WorkerModel.full_name.icontains(search)) | (WorkerModel.worker_code.icontains(search))
+                )
+                
+        attendances = query.all()
+        return JSONResponse([
+            {
+                'id': att.id,
+                'worker_id': att.worker_id,
+                'worker_code': att.worker.worker_code if att.worker else None,
+                'worker_name': att.worker.full_name if att.worker else "Unknown",
+                'session_id': att.session_id,
+                'session_type': att.session.session_type if att.session else None,
+                'status': att.status,
+                'verification_method': att.verification_method,
+                'check_in_at': att.check_in_at.isoformat() if att.check_in_at else None,
+                'check_out_at': att.check_out_at.isoformat() if att.check_out_at else None,
+                'break_start': att.break_start.isoformat() if att.break_start else None,
+                'break_end': att.break_end.isoformat() if att.break_end else None,
+                'latitude': att.latitude,
+                'longitude': att.longitude,
+                'distance': att.distance_from_worksite,
+                'face_match_status': att.face_match_status,
+                'liveness_status': att.liveness_status,
+                'location_status': att.location_status,
+            } for att in attendances
+        ])
     finally:
         db.close()

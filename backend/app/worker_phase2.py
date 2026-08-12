@@ -658,6 +658,22 @@ async def enrollment_complete_endpoint(request: Request) -> JSONResponse:
         worker.biometric_enrollment_status = BiometricEnrollmentStatus.COMPLETED.value
         worker.status = WorkerStatus.ACTIVE.value
         worker.is_active = True
+
+        # Generate face embedding from CENTER sample
+        center_sample = next((s for s in sample_rows if s.capture_type == CaptureType.CENTER.value), None)
+        if center_sample:
+            try:
+                file_path = Path(center_sample.image_reference)
+                if file_path.exists():
+                    img_bytes = file_path.read_bytes()
+                    encoded = base64.b64encode(img_bytes).decode('utf-8')
+                    from backend.app.services.recognition import RecognitionService
+                    embedding = RecognitionService.generate_embedding(encoded)
+                    if embedding:
+                        worker.face_template = json.dumps(embedding)
+            except Exception as e:
+                pass
+
         worker.updated_at = _utc_now()
 
         _audit(
