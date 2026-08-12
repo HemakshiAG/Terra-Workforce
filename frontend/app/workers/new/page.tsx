@@ -150,22 +150,53 @@ export default function NewWorkerPage() {
     setError('');
     setIsSaving(true);
     try {
-      const created = await createWorker(token(), {
-        full_name: draft.full_name.trim(),
-        worker_code: draft.worker_code.trim() || undefined,
-        date_of_birth: draft.date_of_birth || undefined,
-        gender: draft.gender,
-        phone: draft.phone.trim() || undefined,
-        address: draft.address.trim() || undefined,
-        emergency_contact: draft.emergency_contact.trim() || undefined,
-        worksite_id: Number(draft.worksite_id),
-        role: draft.role,
-      } as WorkerCreateRequest);
+      let created: any = null;
+      try {
+        created = await createWorker(token(), {
+          full_name: draft.full_name.trim(),
+          worker_code: draft.worker_code.trim() || undefined,
+          date_of_birth: draft.date_of_birth || undefined,
+          gender: draft.gender,
+          phone: draft.phone.trim() || undefined,
+          address: draft.address.trim() || undefined,
+          emergency_contact: draft.emergency_contact.trim() || undefined,
+          worksite_id: Number(draft.worksite_id),
+          role: draft.role,
+        } as WorkerCreateRequest);
+      } catch (netErr: any) {
+        // Offline Fallback for Worker Creation
+        const { db } = await import('@/lib/db');
+        const { syncEngine } = await import('@/lib/offline/syncEngine');
+        const localId = `LOC-W-${Date.now()}`;
+        const wCode = draft.worker_code.trim() || `W-${Math.floor(Math.random() * 9000) + 1000}`;
+        const now = new Date().toISOString();
+
+        created = {
+          id: Math.floor(Math.random() * 10000) + 500,
+          local_id: localId,
+          worker_id: localId,
+          worker_code: wCode,
+          name: draft.full_name.trim(),
+          full_name: draft.full_name.trim(),
+          role: draft.role,
+          status: 'PENDING_ENROLLMENT',
+          worksite_id: Number(draft.worksite_id),
+          organization_id: 1,
+          biometric_enrollment_status: 'NOT_STARTED',
+          sync_status: 'PENDING',
+          created_at: now,
+          updated_at: now
+        };
+
+        await db.workers.add(created);
+        await syncEngine.enqueue('WORKER', 'CREATE', localId, created);
+      }
+
       setWorker(created);
       updateDraft({ step: 2, worker_code: created.worker_code });
-      setInfo(`Worker created as ${created.worker_code}.`);
+      setInfo(`Worker recorded locally as ${created.worker_code}.`);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Unable to create worker.');
+      setError(err instanceof Error ? err.message : 'Unable to create worker.');
     } finally {
       setIsSaving(false);
     }

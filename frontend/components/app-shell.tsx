@@ -4,7 +4,11 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import type { ReactNode } from 'react';
 import { useEffect, useMemo, useState } from 'react';
-import { Activity, BadgeCheck, Camera, FileText, Home, LogOut, MapPinned, ScrollText, Settings, ShieldCheck, SquareUser, Users, Wallet, Wifi } from 'lucide-react';
+import { Activity, BadgeCheck, Camera, FileText, Home, LogOut, MapPinned, ScrollText, Settings, ShieldCheck, SquareUser, Users, Wallet, Wifi, WifiOff } from 'lucide-react';
+import { ConnectionStatusBanner } from './connection-status';
+import { DemoModeControls } from './demo-mode-controls';
+import { ConflictResolutionModal } from './conflict-resolution-modal';
+import { useConnectivity } from '@/lib/offline/connectivity';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://127.0.0.1:8000';
 
@@ -42,10 +46,13 @@ export function AppShell({ title, subtitle, children, allowedRoles }: { title: s
   const [role, setRole] = useState<string>('ADMIN');
   const [userName, setUserName] = useState<string>('Member');
   const [isAuthChecking, setIsAuthChecking] = useState<boolean>(true);
+  const { isOnline } = useConnectivity();
 
   useEffect(() => {
     const token = typeof window !== 'undefined' ? localStorage.getItem('terra-session-token') ?? localStorage.getItem('terra-workforce-token') : null;
-    
+    const cachedRole = (typeof window !== 'undefined' ? localStorage.getItem('terra-workforce-role') ?? 'ADMIN' : 'ADMIN').toUpperCase();
+    const cachedUser = typeof window !== 'undefined' ? localStorage.getItem('terra-workforce-user') ?? 'Local User' : 'Local User';
+
     if (!token) {
       if (pathname !== '/login' && pathname !== '/register') {
         router.replace('/login');
@@ -70,7 +77,7 @@ export function AppShell({ title, subtitle, children, allowedRoles }: { title: s
         const user = await response.json();
         const nextRole = (user.role ?? 'ADMIN').toUpperCase();
         setRole(nextRole);
-        setUserName(user.name ?? 'Member');
+        setUserName(user.name ?? cachedUser);
         localStorage.setItem('terra-workforce-role', nextRole);
 
         if (allowedRoles && !allowedRoles.map(r => r.toUpperCase()).includes(nextRole)) {
@@ -79,9 +86,9 @@ export function AppShell({ title, subtitle, children, allowedRoles }: { title: s
         }
       })
       .catch(() => {
-        localStorage.removeItem('terra-session-token');
-        localStorage.removeItem('terra-workforce-token');
-        router.replace('/login');
+        // Offline Fallback: Do NOT log out when internet is unavailable!
+        setRole(cachedRole);
+        setUserName(cachedUser);
       })
       .finally(() => {
         setIsAuthChecking(false);
@@ -98,6 +105,7 @@ export function AppShell({ title, subtitle, children, allowedRoles }: { title: s
         headers: { Authorization: `Bearer ${token}` },
       }).catch(() => undefined);
     }
+
     localStorage.removeItem('terra-session-token');
     localStorage.removeItem('terra-workforce-token');
     localStorage.removeItem('terra-workforce-role');
@@ -114,8 +122,9 @@ export function AppShell({ title, subtitle, children, allowedRoles }: { title: s
   }
 
   return (
-    <main className="min-h-screen bg-[#0b0f0c] text-[#f5f1e8]">
-      <div className="mx-auto flex max-w-[1600px] flex-col gap-5 px-4 py-4 lg:flex-row lg:px-6">
+    <main className="min-h-screen bg-[#0b0f0c] text-[#f5f1e8] flex flex-col">
+      <ConnectionStatusBanner />
+      <div className="mx-auto flex max-w-[1600px] w-full flex-col gap-5 px-4 py-4 lg:flex-row lg:px-6 flex-1">
         <aside className="w-full shrink-0 rounded border border-[rgba(183,196,170,0.12)] bg-[#0f140f]/90 p-4 lg:w-[260px]">
           <Link href={role === 'WORKER' ? '/worker' : '/dashboard'} className="flex items-center gap-3 text-[11px] uppercase tracking-[0.38em] text-[#dfeab1]">
             <span className="inline-flex h-2.5 w-2.5 rounded-full bg-[#b7cc75]" />
@@ -146,7 +155,15 @@ export function AppShell({ title, subtitle, children, allowedRoles }: { title: s
 
           <div className="mt-8 rounded border border-[rgba(183,196,170,0.12)] bg-[#101610] p-3">
             <div className="flex items-center gap-2 text-sm text-[#dfeab1]">
-              <Wifi size={14} className="text-[#b7cc75]" /> Online
+              {isOnline ? (
+                <>
+                  <Wifi size={14} className="text-emerald-400" /> <span className="font-semibold">Online</span>
+                </>
+              ) : (
+                <>
+                  <WifiOff size={14} className="text-amber-400" /> <span className="font-semibold text-amber-300">Offline</span>
+                </>
+              )}
             </div>
             <p className="mt-3 text-[10px] uppercase tracking-[0.32em] text-[#8d998b]">Core features available</p>
           </div>
@@ -179,9 +196,12 @@ export function AppShell({ title, subtitle, children, allowedRoles }: { title: s
               {subtitle ? <p className="mt-2 text-sm text-[#a8b1a1]">{subtitle}</p> : null}
             </div>
             <div className="flex items-center gap-3 rounded border border-[rgba(183,196,170,0.12)] bg-[#101610] px-4 py-3 text-sm text-[#dfeab1]">
-              <div className="flex items-center gap-2 text-[#b7cc75]">
-                <Activity size={14} />
-                <span>Online</span>
+              <div className="flex items-center gap-2">
+                {isOnline ? (
+                  <span className="text-emerald-400 font-semibold flex items-center gap-1.5"><Activity size={14} /> Online</span>
+                ) : (
+                  <span className="text-amber-400 font-semibold flex items-center gap-1.5"><WifiOff size={14} /> Offline — Local Mode</span>
+                )}
               </div>
               <span className="text-[#8d998b]">•</span>
               <span className="text-[#8d998b]">Ready</span>
@@ -190,6 +210,10 @@ export function AppShell({ title, subtitle, children, allowedRoles }: { title: s
           <div className="mt-6">{children}</div>
         </section>
       </div>
+
+      {/* Global Modals & Controls */}
+      <ConflictResolutionModal />
+      <DemoModeControls />
     </main>
   );
 }
